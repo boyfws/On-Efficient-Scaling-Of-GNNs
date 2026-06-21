@@ -83,6 +83,7 @@ def gatv2_aggr(
     x: torch.Tensor,
     x_neighbors: torch.Tensor,
     attention_weights: torch.Tensor,
+    edge_attr: torch.Tensor | None = None,
     negative_slope: float = 0.2,
     grad_A_reduce_row_chunk_size: int = 512,
     forward_light_warps: int = 1,
@@ -113,6 +114,16 @@ def gatv2_aggr(
     Returns:
         Aggregated features, shape ``[N, H*D]`` (heads concatenated).
     """
+    if edge_attr and graph.forward_edge_indices and graph.backward_edge_indices:
+        forward_edge_indices = graph.forward_edge_indices
+        backward_edge_indices = graph.backward_edge_indices
+        edge_attr = edge_attr
+    else:
+        forward_edge_indices = None
+        backward_edge_indices = None
+        edge_attr = None
+
+
     return gatv2_function.apply(
         graph.forward_indptr,
         graph.forward_indices,
@@ -132,6 +143,9 @@ def gatv2_aggr(
         backward_light_warps,
         backward_heavy_warps,
         graph.is_directed,
+        forward_edge_indices,
+        backward_edge_indices,
+        edge_attr
     )
 
 

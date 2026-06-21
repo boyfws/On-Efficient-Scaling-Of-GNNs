@@ -38,7 +38,7 @@ def _bucket_nodes_by_degree(
 
 def build_csr_as_is(
     edge_index: torch.Tensor,
-    edge_weight: Optional[torch.Tensor],
+    add_edge_attr: bool,
     num_nodes: int,
     do_transpose: bool = False,
 ):
@@ -58,7 +58,8 @@ def build_csr_as_is(
     perm = (rows * N + cols).argsort()
     rows = rows[perm]
     cols = cols[perm]
-    w = edge_weight[perm] if edge_weight is not None else None
+
+    w = perm if add_edge_attr else None
 
     counts = torch.bincount(rows, minlength=N)
     row_ptr = torch.zeros(N + 1, dtype=torch.long, device=rows.device)
@@ -103,6 +104,9 @@ class AdjacencyForwardBackwardWithNodeBuckets:
     backward_light_nodes: torch.Tensor
     backward_heavy_nodes: torch.Tensor
 
+    backward_edge_indices: torch.Tensor | None = None
+    forward_edge_indices: torch.Tensor | None = None
+
     max_degree: int = -1
     _device: torch.device = torch.device("cpu")
     is_directed: bool | None = None  # None = auto-detect, True/False = explicit
@@ -118,7 +122,12 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             ("forward_heavy_nodes", self.forward_heavy_nodes),
             ("backward_light_nodes", self.backward_light_nodes),
             ("backward_heavy_nodes", self.backward_heavy_nodes),
-        ]:
+            ("forward_edge_indices", self.forward_edge_indices),
+            ("backward_edge_indices", self.backward_edge_indices),
+        ]:  
+            if name.endswith("edge_indices") and t is None:
+                continue  # Optional edge attr indices may be None
+
             assert t.dtype == idx_dtype, f"{name} dtype {t.dtype} doesn't match forward_indptr dtype {idx_dtype}"
         self.index_dtype = idx_dtype
 
@@ -187,6 +196,8 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             backward_light_nodes=bwd_light,
             backward_heavy_nodes=bwd_heavy,
             is_directed=self.is_directed,
+            forward_edge_indices=self.forward_edge_indices,
+            backward_edge_indices=self.backward_edge_indices,
         )
 
     def to(self, device) -> AdjacencyForwardBackwardWithNodeBuckets:
@@ -214,19 +225,27 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         quantile: float = 0.99,
         index_dtype: torch.dtype | None = None,
         is_directed: bool | None = None,
+        add_edge_attr: bool = False
+
     ) -> AdjacencyForwardBackwardWithNodeBuckets:
         """Build from COO edge_index [2, E]. Constructs forward + backward CSR.
 
         Args:
             is_directed: None = auto-detect, True = always directed,
                          False = skip backward CSR (alias to forward).
+            add_edge_attr: Whether to include edge attributes indexes in the constructed CSR matrices.
         """
-        fwd_indptr, fwd_indices, _, fwd_counts = build_csr_as_is(edge_index, None, num_nodes, do_transpose=True)
+        if is_directed is not True and add_edge_attr:
+            raise ValueError("add_edge_attr=True is not supported for undirected graphs (is_directed=False, is_directed=None)")
+        
+
+        fwd_indptr, fwd_indices, fwd_edge_indices, fwd_counts = build_csr_as_is(edge_index, add_edge_attr, num_nodes, do_transpose=True)
 
         if is_directed is not False:
-            bwd_indptr, bwd_indices, _, bwd_counts = build_csr_as_is(edge_index, None, num_nodes, do_transpose=False)
+            bwd_indptr, bwd_indices, bwd_edge_indices, bwd_counts = build_csr_as_is(edge_index, add_edge_attr, num_nodes, do_transpose=False)
         else:
             bwd_counts = fwd_counts
+            bwd_edge_indices = None
 
         if index_dtype is not None:
             fwd_indptr = fwd_indptr.to(index_dtype)
@@ -257,6 +276,8 @@ class AdjacencyForwardBackwardWithNodeBuckets:
             backward_light_nodes=bwd_light,
             backward_heavy_nodes=bwd_heavy,
             is_directed=is_directed,
+            forward_edge_indices=fwd_edge_indices,
+            backward_edge_indices=bwd_edge_indices,
         )
 
     @classmethod
