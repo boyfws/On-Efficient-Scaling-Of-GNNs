@@ -161,6 +161,8 @@ class gatv2_function(torch.autograd.Function):
             fwd_heavy_nodes,
             forward_light_warps,
             forward_heavy_warps,
+            forward_edge_indices,
+            edge_attr,
         )
         ctx.negative_slope = negative_slope
         ctx.grad_A_reduce_row_chunk_size = grad_A_reduce_row_chunk_size
@@ -183,6 +185,9 @@ class gatv2_function(torch.autograd.Function):
             fwd_heavy_nodes,
             bwd_light_nodes,
             bwd_heavy_nodes,
+            forward_edge_indices,
+            backward_edge_indices,
+            edge_attr,
         )
 
         return output
@@ -203,6 +208,9 @@ class gatv2_function(torch.autograd.Function):
             fwd_heavy_nodes,
             bwd_light_nodes,
             bwd_heavy_nodes,
+            forward_edge_indices,
+            backward_edge_indices,
+            edge_attr,
         ) = ctx.saved_tensors
 
         num_heads = ctx.heads
@@ -210,7 +218,7 @@ class gatv2_function(torch.autograd.Function):
 
         grad_output = grad_output.view(-1, num_heads, head_dim)
 
-        grad_x_left, grad_x_right, grad_attention = _C.gatv2_backward(
+        grad_x_left, grad_x_right, grad_attention, grad_edge_attr = _C.gatv2_backward(
             grad_output,
             x_left,
             x_right,
@@ -229,10 +237,14 @@ class gatv2_function(torch.autograd.Function):
             ctx.backward_light_warps,
             ctx.backward_heavy_warps,
             ctx.is_directed,
+            forward_edge_indices,
+            backward_edge_indices,
+            edge_attr
         )
 
-        # 4 CSR tensors + 3 gradients + 11 non-Variable args = 18 total
-        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 11
+        # 4 CSR tensors + 3 gradients + 11 non-Variable args = 18 total + forward_edge_indices + backward_edge_indices + edge_attr
+
+        return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 11 + (None,) * 2 + (grad_edge_attr,)
 
 
 class _FusedGraphAttention(torch.autograd.Function):

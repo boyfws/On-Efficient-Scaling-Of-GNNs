@@ -560,6 +560,12 @@ struct TileOps<1, float> {
         float s = leaky_relu_elementwise(l + r, ns);
         return s * a;
     }
+
+    static __device__ __forceinline__ float gatv2_dot_leaky_relu( vec_t l, vec_t r, vec_t e, vec_t a, ns_t ns ) { 
+        float s = leaky_relu_elementwise(l + r + e, ns); 
+        return s * a; 
+    }
+
     static __device__ __forceinline__ float dot_product(vec_t a, vec_t b) {
         return a * b;
     }
@@ -629,6 +635,15 @@ struct TileOps<4, float> {
             leaky_relu_elementwise(l.w + r.w, ns)
         );
             return dot_product_f4(sum, a);
+    }
+    static __device__ __forceinline__ float gatv2_dot_leaky_relu( vec_t l, vec_t r, vec_t e, vec_t a, ns_t ns ) { 
+        float4 sum = make_float4( 
+            leaky_relu_elementwise(l.x + r.x + e.x, ns), 
+            leaky_relu_elementwise(l.y + r.y + e.y, ns), 
+            leaky_relu_elementwise(l.z + r.z + e.z, ns), 
+            leaky_relu_elementwise(l.w + r.w + e.w, ns) 
+        ); 
+            return dot_product_f4(sum, a); 
     }
     static __device__ __forceinline__ float dot_product(vec_t a, vec_t b) {
         return dot_product_f4(a, b);
@@ -718,6 +733,14 @@ struct TileOps<2, cuda_t> {
         float2 pf = Ops::to_float2(prod); // TODO maybe do it in vec2_t and than cast to float after the summation?
         return pf.x + pf.y;
     }
+    static __device__ __forceinline__ float gatv2_dot_leaky_relu( vec_t l, vec_t r, vec_t e, vec_t a, ns_t ns ) { 
+        vec2_t sum = Ops::add(Ops::add(l, r), e); 
+        vec2_t act = Ops::leaky_relu(sum, ns); 
+        vec2_t prod = Ops::mul(act, a); 
+        float2 pf = Ops::to_float2(prod); 
+        return pf.x + pf.y; 
+    }
+
     static __device__ __forceinline__ float dot_product(vec_t a, vec_t b) {
         vec2_t prod = Ops::mul(a, b);
         float2 pf = Ops::to_float2(prod);
@@ -824,6 +847,20 @@ struct TileOps<8, cuda_t> {
         }
         return dot;
     }
+
+    static __device__ __forceinline__ float gatv2_dot_leaky_relu( vec_t l, vec_t r, vec_t e, vec_t a, ns_t ns ) { 
+        float dot = 0.0f; 
+        #pragma unroll 
+        for (int p = 0; p < 4; ++p) { 
+            vec2_t sum = Ops::add( Ops::add(l.v[p], r.v[p]), e.v[p] ); 
+            vec2_t act = Ops::leaky_relu(sum, ns); 
+            vec2_t prod = Ops::mul(act, a.v[p]); 
+            float2 pf = Ops::to_float2(prod); 
+            dot += pf.x + pf.y; 
+        } 
+        return dot; 
+    }
+    
     static __device__ __forceinline__ float dot_product(vec_t a, vec_t b) {
         float dot = 0.0f;
         #pragma unroll

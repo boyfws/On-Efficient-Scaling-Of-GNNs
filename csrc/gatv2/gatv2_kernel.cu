@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include <c10/util/Optional.h>
 
 // =============================================================================
 // GATv2 Kernel with CSR Graph Format
@@ -20,6 +21,12 @@ GATv2Forward_Kernel(
     const index_t* __restrict__ d_col_idx,
     const index_t* __restrict__ node_indices,   // node indirection
     const cuda_t* __restrict__ d_attn_vec,
+
+    const index_t* __restrict__ d_edge_indices,
+    const cuda_t* __restrict__ d_edge_attr,
+    int64_t stride_edge_attr_e,
+    int64_t stride_edge_attr_h,
+
     cuda_t* __restrict__ d_h_out,
     float* __restrict__ d_logsumexp_out,
     float negative_slope
@@ -40,6 +47,8 @@ GATv2Forward_Kernel(
     const int lane    = threadIdx.x % kMaxThreadsInWarp;
 
     if (node_i >= (int)N || head_h >= (int)H) return;
+
+    const bool has_edge_attr = d_edge_attr != nullptr;
 
     index_t edge_start = d_row_ptr[node_i];
     index_t edge_end   = d_row_ptr[node_i + 1];
@@ -100,18 +109,37 @@ GATv2Forward_Kernel(
 
     // Warp-strided neighbor loop
     for (int k = warp_id; k < num_neighbors; k += WARPS_PER_BLOCK) {
-        index_t neighbor_j = d_col_idx[edge_start + static_cast<index_t>(k)];
+        const index_t edge_pos = edge_start + static_cast<index_t>(k);
+
+        index_t neighbor_j = d_col_idx[edge_pos];
+
+        const cuda_t* edge_base = nullptr;
+
+        if (has_edge_attr) { 
+            const index_t edge_id = d_edge_indices[edge_pos]; 
+            edge_base = d_edge_attr + static_cast<int64_t>(edge_id) * stride_edge_attr_e + static_cast<int64_t>(head_h) * stride_edge_attr_h; 
+        }
+
         const cuda_t* r_base = d_r + neighbor_j * stride_r_n + head_h * stride_r_h;
 
         float dot_lane = 0.f;
         #pragma unroll
         for (int t = 0; t < VECS_PER_LANE; ++t) {
             int v = lane + kMaxThreadsInWarp * t;
+
+
             if (v < NUM_VECS) {
                 vec_t lv = Tile::load(l_sh, v);
                 vec_t rv = Tile::load(r_base, v);
                 vec_t av = Tile::load(a_base, v);
-                dot_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
+
+                if (has_edge_attr) {
+                    vec_t ev = Tile::load(edge_base, v);
+                    dot_lane += Tile::gatv2_dot_leaky_relu(lv, rv, ev, av, ns);
+                } else {
+                    dot_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
+
+                }
             }
         }
         float dot = warp_reduce_sum(dot_lane);
@@ -1129,12 +1157,17 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     torch::Tensor light_nodes,
     torch::Tensor heavy_nodes,
     int light_warps_per_block,
-    int heavy_warps_per_block
+    int heavy_warps_per_block,
+    c10::optional<torch::Tensor> forward_edge_indices, 
+    c10::optional<torch::Tensor> edge_attr
 ) {
 
     TORCH_CHECK(l.is_cuda() && r.is_cuda(), "l, r must be CUDA");
     TORCH_CHECK(l.dim() == 3 && r.dim() == 3, "l, r must be [N, H, D]");
     TORCH_CHECK(l.sizes() == r.sizes(), "l, r sizes must match");
+    TORCH_CHECK(forward_edge_indices.has_value() == edge_attr.has_value(), "forward_edge_indices and edge_attr must both be provided or both be nullopt");
+    
+    const bool has_edge_attr = edge_attr.has_value();
 
     TORCH_CHECK(row_ptr.is_cuda(), "row_ptr must be a CUDA tensor");
     TORCH_CHECK(col_idx.is_cuda(), "col_idx must be a CUDA tensor");
@@ -1143,7 +1176,25 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     TORCH_CHECK(l.size(0) == r.size(0), "l and r must have same number of nodes");
     TORCH_CHECK(l.size(1) == r.size(1), "l and r must have same head dimension");
     TORCH_CHECK(l.size(2) == r.size(2), "l and r must have same feature dimension");
+    TORCH_CHECK(attn_vec.dim() == 2, "attn_vec must be [H, D]");
     TORCH_CHECK(l.size(2) == attn_vec.size(1), "attn_vec dimension must match features");
+
+    if (has_edge_attr) {
+        TORCH_CHECK(edge_attr.value().is_cuda(), "edge_attr must be CUDA");
+        TORCH_CHECK(forward_edge_indices.value().is_cuda(), "forward_edge_indices must be CUDA");
+        
+        TORCH_CHECK(edge_attr.value().dim() == 3, "edge_attr must be [E, H, D]");
+        TORCH_CHECK(edge_attr.value().size(0) == col_idx.numel(), "edge_attr and col_idx must have same number of edges");
+        TORCH_CHECK(edge_attr.value().size(1) == r.size(1), "edge_attr and r must have same head dimension");
+        TORCH_CHECK(edge_attr.value().size(2) == r.size(2), "edge_attr and r must have same feature dimension");
+
+        TORCH_CHECK(
+            forward_edge_indices.value().dim() == 1 &&
+            forward_edge_indices.value().numel() == col_idx.numel(),
+            "forward_edge_indices must have shape [E] with one ID per CSR edge"
+        );
+    }
+
 
     auto idx_dtype = row_ptr.scalar_type();
     TORCH_CHECK(is_supported_index_type(idx_dtype),
@@ -1155,11 +1206,15 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     TORCH_CHECK(l.dtype() == torch::kFloat32 || l.dtype() == torch::kFloat16 || l.dtype() == torch::kBFloat16,
                 "l must be float32, float16, or bfloat16");
 
+    if (has_edge_attr) {
+        TORCH_CHECK(edge_attr.value().scalar_type() == l.scalar_type(), "edge_attr must have same dtype as l and r");
+        TORCH_CHECK(forward_edge_indices.value().scalar_type() == idx_dtype, "forward_edge_indices must have same dtype as row_ptr and col_idx");
+    }
+
     const int64_t N = l.size(0);
     const int64_t H = l.size(1);
     const int64_t D = l.size(2);
 
-    TORCH_CHECK(attn_vec.dim() == 2, "attn_vec must be [H, D]");
     TORCH_CHECK(attn_vec.size(0) == H, "attn_vec H mismatch");
     TORCH_CHECK(attn_vec.size(1) == D, "attn_vec D mismatch");
     TORCH_CHECK(D % 4 == 0, "head_dim (D) must be divisible by 4");
@@ -1168,8 +1223,29 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
     TORCH_CHECK(row_ptr.is_contiguous(), "row_ptr must be contiguous");
     TORCH_CHECK(col_idx.is_contiguous(), "col_idx must be contiguous");
 
+    if (has_edge_attr) {
+        TORCH_CHECK(forward_edge_indices.value().is_contiguous(), "forward_edge_indices must be contiguous");
+        TORCH_CHECK(edge_attr.value().is_contiguous(), "edge_attr must be contiguous");
+    }
+    
+
     auto l_strides = l.strides();
     auto r_strides = r.strides();
+
+    int64_t stride_edge_attr_e = 0;
+    int64_t stride_edge_attr_h = 0;
+
+    if (has_edge_attr) {
+        const auto edge_strides = edge_attr.value().strides();
+
+        stride_edge_attr_e = edge_strides[0];
+        stride_edge_attr_h = edge_strides[1];
+
+        TORCH_CHECK(
+            edge_attr.value().stride(2) == 1,
+            "edge_attr feature dimension D must be contiguous"
+        );
+    }
 
     int64_t stride_l_n = l_strides[0];
     int64_t stride_l_h = l_strides[1];
@@ -1205,6 +1281,14 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
             auto* r_ptr     = reinterpret_cast<const cuda_t*>(r.data_ptr<torch_t>());
             auto* attn_ptr  = reinterpret_cast<const cuda_t*>(attn_vec.data_ptr<torch_t>());
             auto* h_out_ptr = reinterpret_cast<cuda_t*>(h_out.data_ptr<torch_t>());
+            auto* edge_attr_ptr = has_edge_attr ? reinterpret_cast<const cuda_t*>(edge_attr.value().data_ptr<torch_t>()) : nullptr;
+
+            const index_t* edge_indices_ptr = nullptr;
+
+            if (has_edge_attr) {
+                edge_indices_ptr =
+                    index_ptr<index_t>(forward_edge_indices.value());
+            }
 
             // l_sh + W * D float + 2 * W float
             size_t shmem = DC * sizeof(cuda_t) + W * DC * sizeof(float) + 2 * W * sizeof(float);
@@ -1216,7 +1300,11 @@ std::vector<torch::Tensor> gatv2_forward_cuda(
                 N, H, DC, l_ptr, r_ptr, stride_l_n, stride_l_h, stride_r_n, stride_r_h,
                 index_ptr<index_t>(row_ptr), index_ptr<index_t>(col_idx),
                 index_ptr<index_t>(node_indices),
-                attn_ptr, h_out_ptr, d_logsumexp, negative_slope);
+                attn_ptr, 
+                edge_indices_ptr,
+                edge_attr_ptr,
+                stride_edge_attr_e, stride_edge_attr_h,
+                h_out_ptr, d_logsumexp, negative_slope);
         }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
            MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
            MakeIntVariant<32, 64, 128, 256>((int)D),
@@ -1250,7 +1338,10 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor bwd_heavy_nodes,
     int light_warps_per_block,
     int heavy_warps_per_block,
-    bool is_directed
+    bool is_directed,
+    c10::optional<torch::Tensor> forward_edge_indices, 
+    c10::optional<torch::Tensor> backward_edge_indices, 
+    c10::optional<torch::Tensor> edge_attr
 ) {
     TORCH_CHECK(grad_h.is_cuda(), "grad_h must be a CUDA tensor");
     TORCH_CHECK(l.is_cuda(), "l must be a CUDA tensor");

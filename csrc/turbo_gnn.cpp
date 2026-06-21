@@ -25,7 +25,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("attn_vec"), py::arg("negative_slope") = 0.2f,
           py::arg("light_nodes"), py::arg("heavy_nodes"),
           py::arg("light_warps_per_block") = 1,
-          py::arg("heavy_warps_per_block") = 8);
+          py::arg("heavy_warps_per_block") = 8,
+          py::arg("forward_edge_indices") = py::none(),
+          py::arg("edge_attr") = py::none()
+      );
 
     m.def("gatv2_backward", &gatv2_backward_cuda,
           "GATv2 backward pass (CUDA)",
@@ -39,7 +42,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bwd_light_nodes"), py::arg("bwd_heavy_nodes"),
           py::arg("light_warps_per_block") = 1,
           py::arg("heavy_warps_per_block") = 8,
-          py::arg("is_directed") = true);
+          py::arg("is_directed") = true,
+          py::arg("forward_edge_indices") = py::none(),
+          py::arg("backward_edge_indices") = py::none(),
+          py::arg("edge_attr") = py::none()
+      );
 
     // Graph Transformer aggregation
     m.def("gt_forward_csr_mh", &graph_attention_forward_csr_mh_cuda,
