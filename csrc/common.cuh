@@ -579,6 +579,25 @@ struct TileOps<1, float> {
         ga[0] = fmaf(ge, t_ij, ga[0]);
         gl[0] = fmaf(ge * tder, a, gl[0]);
     }
+
+    static __device__ __forceinline__ void gatv2_accum_grad_al(
+        float* ga,
+        float* gl,
+        float ge,
+        vec_t l,
+        vec_t r,
+        vec_t e,
+        vec_t a,
+        float ns
+    ) {
+        const float edge = l + r + e;
+        const float tder = leaky_relu_der_elementwise(edge, ns);
+        const float t_ij = tder * edge;
+
+        ga[0] = fmaf(ge, t_ij, ga[0]);
+        gl[0] = fmaf(ge * tder, a, gl[0]);
+    }
+
     static __device__ __forceinline__ void gatv2_accum_grad_r(float* gr, float alpha, vec_t gh, float ge, vec_t l, vec_t r, vec_t a, float ns) {
         float edge = l + r;
         float tder = leaky_relu_der_elementwise(edge, ns);
@@ -661,6 +680,15 @@ struct TileOps<4, float> {
         f4_fma(*(float4*)ga, ge, t_ij);
         f4_fma(*(float4*)gl, ge, f4_mul(tder, a));
     }
+
+    static __device__ __forceinline__ void gatv2_accum_grad_al(float* ga, float* gl, float ge, vec_t l, vec_t r, vec_t e, vec_t a, float ns ) { 
+            const float4 edge = f4_add(f4_add(l, r), e); 
+            const float4 tder = f4_leaky_relu_der(edge, ns); 
+            const float4 t_ij = f4_mul(tder, edge); 
+            f4_fma(*(float4*)ga, ge, t_ij);
+            f4_fma(*(float4*)gl, ge, f4_mul(tder, a));
+    }
+
     static __device__ __forceinline__ void gatv2_accum_grad_r(float* gr, float alpha, vec_t gh, float ge, vec_t l, vec_t r, vec_t a, float ns) {
         float4 edge = f4_add(l, r);
         float4 tder = f4_leaky_relu_der(edge, ns);
@@ -765,6 +793,23 @@ struct TileOps<2, cuda_t> {
         gl[0] = fmaf(ge * tder0, af.x, gl[0]);
         gl[1] = fmaf(ge * tder1, af.y, gl[1]);
     }
+
+    static __device__ __forceinline__ void gatv2_accum_grad_al( float* ga, float* gl, float ge, vec_t l, vec_t r, vec_t e, vec_t a, float ns ) { 
+        const float2 lf = Ops::to_float2(l); 
+        const float2 rf = Ops::to_float2(r); 
+        const float2 ef = Ops::to_float2(e); 
+        const float2 af = Ops::to_float2(a); 
+        const float edge0 = lf.x + rf.x + ef.x; 
+        const float edge1 = lf.y + rf.y + ef.y; 
+        const float tder0 = leaky_relu_der_elementwise(edge0, ns); 
+        const float tder1 = leaky_relu_der_elementwise(edge1, ns); 
+        ga[0] = fmaf( ge, tder0 * edge0, ga[0] ); 
+        ga[1] = fmaf( ge, tder1 * edge1, ga[1] ); 
+        gl[0] = fmaf( ge * tder0, af.x, gl[0] ); 
+        gl[1] = fmaf( ge * tder1, af.y, gl[1] ); 
+    }
+
+
     static __device__ __forceinline__ void gatv2_accum_grad_r(float* gr, float alpha, vec_t gh, float ge, vec_t l, vec_t r, vec_t a, float ns) {
         float2 lf = Ops::to_float2(l);
         float2 rf = Ops::to_float2(r);
@@ -895,6 +940,25 @@ struct TileOps<8, cuda_t> {
             gl[p * 2 + 1] = fmaf(ge * tder1, af.y, gl[p * 2 + 1]);
         }
     }
+
+    static __device__ __forceinline__ void gatv2_accum_grad_al( float* ga, float* gl, float ge, vec_t l, vec_t r, vec_t e, vec_t a, float ns ) { 
+        #pragma unroll 
+        for (int p = 0; p < 4; ++p) { 
+            const float2 lf = Ops::to_float2(l.v[p]); 
+            const float2 rf = Ops::to_float2(r.v[p]); 
+            const float2 ef = Ops::to_float2(e.v[p]); 
+            const float2 af = Ops::to_float2(a.v[p]); 
+            const float edge0 = lf.x + rf.x + ef.x; 
+            const float edge1 = lf.y + rf.y + ef.y; 
+            const float tder0 = leaky_relu_der_elementwise(edge0, ns); 
+            const float tder1 = leaky_relu_der_elementwise(edge1, ns); 
+            ga[p * 2] = fmaf( ge, tder0 * edge0, ga[p * 2] ); 
+            ga[p * 2 + 1] = fmaf( ge, tder1 * edge1, ga[p * 2 + 1] ); 
+            gl[p * 2] = fmaf( ge * tder0, af.x, gl[p * 2] ); 
+            gl[p * 2 + 1] = fmaf( ge * tder1, af.y, gl[p * 2 + 1] ); 
+        } 
+    }
+
     static __device__ __forceinline__ void gatv2_accum_grad_r(float* gr, float alpha, vec_t gh, float ge, vec_t l, vec_t r, vec_t a, float ns) {
         #pragma unroll
         for (int p = 0; p < 4; ++p) {
