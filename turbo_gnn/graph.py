@@ -214,6 +214,8 @@ class AdjacencyForwardBackwardWithNodeBuckets:
         self.forward_heavy_nodes = self.forward_heavy_nodes.to(device)
         self.backward_light_nodes = self.backward_light_nodes.to(device)
         self.backward_heavy_nodes = self.backward_heavy_nodes.to(device)
+        self.forward_edge_indices = self.forward_edge_indices.to(device) if self.forward_edge_indices is not None else None
+        self.backward_edge_indices = self.backward_edge_indices.to(device) if self.backward_edge_indices is not None else None
         torch.cuda.empty_cache()
         return self
 

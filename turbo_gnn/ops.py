@@ -114,7 +114,7 @@ def gatv2_aggr(
     Returns:
         Aggregated features, shape ``[N, H*D]`` (heads concatenated).
     """
-    if edge_attr and graph.forward_edge_indices and graph.backward_edge_indices:
+    if edge_attr is not None and graph.forward_edge_indices is not None and graph.backward_edge_indices is not None:
         forward_edge_indices = graph.forward_edge_indices
         backward_edge_indices = graph.backward_edge_indices
         edge_attr = edge_attr
