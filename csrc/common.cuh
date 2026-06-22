@@ -604,6 +604,38 @@ struct TileOps<1, float> {
         gr[0] = fmaf(alpha, gh, gr[0]);
         gr[0] = fmaf(ge * tder, a, gr[0]);
     }
+    static __device__ __forceinline__ void gatv2_accum_grad_r(
+        float* gr,
+        float* grad_edge_base,
+        int vec_idx,
+        float alpha,
+        vec_t gh,
+        float grad_score,
+        vec_t l,
+        vec_t r,
+        vec_t e,
+        vec_t a,
+        float ns
+    ) {
+        const float edge = l + r + e;
+
+        const float tder =
+            leaky_relu_der_elementwise(
+                edge,
+                ns
+            );
+
+        const float score_path_grad = grad_score * tder * a;
+
+
+        gr[0] = fmaf(alpha, gh, gr[0]);
+
+        gr[0] += score_path_grad;
+
+        grad_edge_base[vec_idx] = score_path_grad;
+    }
+
+
     static __device__ __forceinline__ void write(float* out, int vec_idx, const float* acc, float inv_sum) {
         out[vec_idx] = acc[0] * inv_sum;
     }
@@ -695,6 +727,54 @@ struct TileOps<4, float> {
         f4_fma(*(float4*)gr, alpha, gh);
         f4_fma(*(float4*)gr, ge, f4_mul(tder, a));
     }
+    static __device__ __forceinline__ void gatv2_accum_grad_r(
+        float* gr,
+        float* grad_edge_base,
+        int vec_idx,
+        float alpha,
+        vec_t gh,
+        float ge,
+        vec_t l,
+        vec_t r,
+        vec_t e,
+        vec_t a,
+        float ns
+    ) {
+        // Preactivation: l_i + r_j + edge_attr_ij
+        float4 edge = f4_add(f4_add(l, r), e);
+
+        // LeakyReLU'(l_i + r_j + edge_attr_ij)
+        float4 tder = f4_leaky_relu_der(edge, ns);
+
+        // a * LeakyReLU'(l_i + r_j + edge_attr_ij)
+        float4 score_path = f4_mul(tder, a);
+
+        // Value path:
+        // grad_r += alpha_ij * grad_h_i
+        f4_fma(
+            *(float4*)gr,
+            alpha,
+            gh
+        );
+
+        // Attention-score path:
+        // grad_r += ge * tder * a
+        f4_fma(
+            *(float4*)gr,
+            ge,
+            score_path
+        );
+
+        // grad_edge_attr = ge * tder * a
+        reinterpret_cast<float4*>(grad_edge_base)[vec_idx] =
+            make_float4(
+                ge * score_path.x,
+                ge * score_path.y,
+                ge * score_path.z,
+                ge * score_path.w
+            );
+    }
+
     static __device__ __forceinline__ void write(float* out, int vec_idx, const float* acc, float inv_sum) {
         reinterpret_cast<float4*>(out)[vec_idx] = make_float4(
             acc[0] * inv_sum, acc[1] * inv_sum,
@@ -824,6 +904,60 @@ struct TileOps<2, cuda_t> {
         gr[1] = fmaf(alpha, ghf.y, gr[1]);
         gr[1] = fmaf(ge * tder1, af.y, gr[1]);
     }
+
+    static __device__ __forceinline__ void gatv2_accum_grad_r(
+        float* gr,
+        cuda_t* grad_edge_base,
+        int vec_idx,
+        float alpha,
+        vec_t gh,
+        float ge,
+        vec_t l,
+        vec_t r,
+        vec_t e,
+        vec_t a,
+        float ns
+    ) {
+        float2 lf  = Ops::to_float2(l);
+        float2 rf  = Ops::to_float2(r);
+        float2 ef  = Ops::to_float2(e);
+        float2 af  = Ops::to_float2(a);
+        float2 ghf = Ops::to_float2(gh);
+
+        float edge0 = lf.x + rf.x + ef.x;
+        float edge1 = lf.y + rf.y + ef.y;
+
+        float tder0 =
+            leaky_relu_der_elementwise(edge0, ns);
+
+        float tder1 =
+            leaky_relu_der_elementwise(edge1, ns);
+
+        float grad_edge0 =
+            ge * tder0 * af.x;
+
+        float grad_edge1 =
+            ge * tder1 * af.y;
+
+        // Value path
+        gr[0] = fmaf(alpha, ghf.x, gr[0]);
+        gr[1] = fmaf(alpha, ghf.y, gr[1]);
+
+        // Attention-score path
+        gr[0] += grad_edge0;
+        gr[1] += grad_edge1;
+
+        // grad_edge_attr[edge_id, head_h, :]
+        *reinterpret_cast<vec2_t*>(
+            &grad_edge_base[vec_idx * ELEM_PER_VEC]
+        ) = Ops::from_float2(
+            make_float2(
+                grad_edge0,
+                grad_edge1
+            )
+        );
+    }
+
     static __device__ __forceinline__ void write(cuda_t* out, int vec_idx, const float* acc, float inv_sum) {
         float2 of = make_float2(acc[0] * inv_sum, acc[1] * inv_sum);
         *reinterpret_cast<vec2_t*>(&out[vec_idx * 2]) = Ops::from_float2(of);
@@ -976,6 +1110,76 @@ struct TileOps<8, cuda_t> {
             gr[p * 2 + 1] = fmaf(ge * tder1, af.y, gr[p * 2 + 1]);
         }
     }
+
+    static __device__ __forceinline__ void gatv2_accum_grad_r(
+        float* gr,
+        cuda_t* grad_edge_base,
+        int vec_idx,
+        float alpha,
+        vec_t gh,
+        float ge,
+        vec_t l,
+        vec_t r,
+        vec_t e,
+        vec_t a,
+        float ns
+    ) {
+        Vec8<cuda_t> grad_edge;
+
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            float2 lf  = Ops::to_float2(l.v[p]);
+            float2 rf  = Ops::to_float2(r.v[p]);
+            float2 ef  = Ops::to_float2(e.v[p]);
+            float2 af  = Ops::to_float2(a.v[p]);
+            float2 ghf = Ops::to_float2(gh.v[p]);
+
+            float edge0 = lf.x + rf.x + ef.x;
+            float edge1 = lf.y + rf.y + ef.y;
+
+            float tder0 =
+                leaky_relu_der_elementwise(edge0, ns);
+
+            float tder1 =
+                leaky_relu_der_elementwise(edge1, ns);
+
+            float grad_edge0 =
+                ge * tder0 * af.x;
+
+            float grad_edge1 =
+                ge * tder1 * af.y;
+
+            // Value path
+            gr[p * 2] =
+                fmaf(alpha, ghf.x, gr[p * 2]);
+
+            gr[p * 2 + 1] =
+                fmaf(alpha, ghf.y, gr[p * 2 + 1]);
+
+            // Attention-score path
+            gr[p * 2] += grad_edge0;
+            gr[p * 2 + 1] += grad_edge1;
+
+            // Собираем две компоненты grad_edge_attr
+            grad_edge.v[p] =
+                Ops::from_float2(
+                    make_float2(
+                        grad_edge0,
+                        grad_edge1
+                    )
+                );
+        }
+
+        // Записываем 8 последовательных компонент:
+        // grad_edge_attr[edge_id, head_h, vec_idx * 8 : (vec_idx + 1) * 8]
+        store_vec8(
+            &grad_edge_base[
+                vec_idx * ELEM_PER_VEC
+            ],
+            grad_edge
+        );
+    }
+
     static __device__ __forceinline__ void write(cuda_t* out, int vec_idx, const float* acc, float inv_sum) {
         Vec8<cuda_t> out_v8;
         #pragma unroll

@@ -530,7 +530,14 @@ GATv2Backward_R(
     const float* __restrict__ d_logsumexp,   // [N, H]
     const float* __restrict__ d_G,           // [N, H]
     float negative_slope,
-    cuda_t* __restrict__ grad_r              // [N, H, D]
+    cuda_t* __restrict__ grad_r,              // [N, H, D]
+
+    cuda_t* __restrict__ d_grad_edge_attr = nullptr, 
+    const cuda_t* __restrict__ d_edge_attr = nullptr, 
+    int64_t stride_edge_attr_e = 0, 
+    int64_t stride_edge_attr_h = 0, 
+    const index_t* __restrict__ d_edge_indices = nullptr
+
 ) {
     constexpr int VW = SelectVW<D_CONST, cuda_t>::value;
     using Tile = TileOps<VW, cuda_t>;
@@ -547,6 +554,8 @@ GATv2Backward_R(
     const int lane    = threadIdx.x % kMaxThreadsInWarp;
 
     if (node_j >= (int)N || head_h >= (int)H) return;
+
+    const bool has_edge_attr = d_edge_attr != nullptr;
 
     index_t edge_start = d_row_ptr_T[node_j];
     index_t edge_end   = d_row_ptr_T[node_j + 1];
@@ -597,12 +606,31 @@ GATv2Backward_R(
 
     // Warp-strided edge loop
     for (int idx = warp_id; idx < num_incoming; idx += WARPS_PER_BLOCK) {
-        index_t node_i = d_col_idx_T[edge_start + static_cast<index_t>(idx)];
+        // index_t node_i = d_col_idx_T[edge_start + static_cast<index_t>(idx)];
+        const index_t edge_pos = edge_start + static_cast<index_t>(idx); 
+        const index_t node_i = d_col_idx_T[edge_pos];
+
         const cuda_t* li_base  = d_l + node_i * stride_l_n + head_h * stride_l_h;
         const cuda_t* ghi_base = grad_h + node_i * stride_gh_n + head_h * stride_gh_h;
 
         float L_i_h = d_logsumexp[node_i * H + head_h];
         float G_i_h = d_G[node_i * H + head_h];
+
+        const cuda_t* edge_base = nullptr; 
+        cuda_t* grad_edge_base = nullptr;
+
+        if (has_edge_attr) { 
+            // backward CSR position -> original edge ID 
+            const index_t edge_id = d_edge_indices[edge_pos]; 
+            
+            edge_base = d_edge_attr + static_cast<int64_t>(edge_id) * stride_edge_attr_e + static_cast<int64_t>(head_h) * stride_edge_attr_h; 
+
+            // grad_edge_attr is created contiguous as [E, H, D]  
+            grad_edge_base = d_grad_edge_attr 
+            + ( 
+                static_cast<int64_t>(edge_id) * static_cast<int64_t>(H) + static_cast<int64_t>(head_h) 
+            ) * D_CONST; 
+        }
 
         float e_lane = 0.f;
         float p_lane = 0.f;
@@ -614,7 +642,16 @@ GATv2Backward_R(
                 vec_t rv  = Tile::load(rj_sh, v);
                 vec_t av  = Tile::load(a_base, v);
                 vec_t ghv = Tile::load(ghi_base, v);
-                e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
+
+                if (has_edge_attr) {
+                    vec_t ev = Tile::load(edge_base, v);
+                    e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, ev, av, ns);
+                } else {
+                    e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
+
+                }
+
+                //e_lane += Tile::gatv2_dot_leaky_relu(lv, rv, av, ns);
                 p_lane += Tile::dot_product(ghv, rv);
             }
         }
@@ -633,8 +670,36 @@ GATv2Backward_R(
                 vec_t av  = Tile::load(a_base, v);
                 vec_t ghv = Tile::load(ghi_base, v);
                 int base_f = v * EPV;
-                Tile::gatv2_accum_grad_r(&my_gradr[base_f], alpha_ij, ghv,
-                                   grad_e_ij, lv, rv, av, negative_slope);
+
+                if (has_edge_attr) {
+                    const vec_t ev = Tile::load(edge_base, v);
+
+                    Tile::gatv2_accum_grad_r(
+                        &my_gradr[base_f],
+                        grad_edge_base,
+                        v,
+                        alpha_ij,
+                        ghv,
+                        grad_e_ij,
+                        lv,
+                        rv,
+                        ev,
+                        av,
+                        negative_slope
+                    );
+                } else {
+                    Tile::gatv2_accum_grad_r(
+                        &my_gradr[base_f],
+                        alpha_ij,
+                        ghv,
+                        grad_e_ij,
+                        lv,
+                        rv,
+                        av,
+                        negative_slope
+                    );
+                }
+
             }
         }
     }
@@ -1415,6 +1480,11 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
 
     TORCH_CHECK( !has_edge_attr || is_directed, "edge_attr is currently only supported for directed graphs" );
 
+    TORCH_CHECK(
+        col_idx.numel() == col_idx_T.numel(),
+        "forward and backward CSR must contain the same number of edges"
+    );
+
     TORCH_CHECK(grad_h.dtype() == l.dtype() && l.dtype() == r.dtype() && l.dtype() == attn_vec.dtype(),
                 "grad_h, l, r, and attn_vec must have the same dtype");
     TORCH_CHECK(l.dtype() == torch::kFloat32 || l.dtype() == torch::kFloat16 || l.dtype() == torch::kBFloat16,
@@ -1465,6 +1535,9 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
         TORCH_CHECK(forward_edge_indices.value().is_contiguous(), "forward_edge_indices must be contiguous");
         TORCH_CHECK(backward_edge_indices.value().is_contiguous(), "backward_edge_indices must be contiguous");
         TORCH_CHECK(edge_attr.value().dtype() == l.dtype(), "edge_attr must have same dtype as l and r");
+
+        TORCH_CHECK( forward_edge_indices.value().scalar_type() == idx_dtype, "forward_edge_indices must have the same dtype as row_ptr" );
+        TORCH_CHECK( backward_edge_indices.value().scalar_type() == idx_dtype, "backward_edge_indices must have the same dtype as row_ptr" );
 
     }
 
@@ -1526,7 +1599,7 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
     torch::Tensor grad_edge_attr; 
     
     if (has_edge_attr) { 
-        grad_edge_attr = torch::empty( edge_attr.value().sizes(), typed_options ); 
+        grad_edge_attr = torch::zeros( edge_attr.value().sizes(), typed_options ); 
     }
 
     const float* d_logsumexp = logsumexp.data_ptr<float>();
@@ -1609,6 +1682,16 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                 auto* attn_ptr   = reinterpret_cast<const cuda_t*>(attn_vec.data_ptr<torch_t>());
                 auto* grad_r_ptr = reinterpret_cast<cuda_t*>(grad_r.data_ptr<torch_t>());
 
+                auto grad_edge_attr_ptr = has_edge_attr ? reinterpret_cast<cuda_t*>(grad_edge_attr.data_ptr<torch_t>()) : nullptr;
+                auto* edge_attr_ptr = has_edge_attr ? reinterpret_cast<const cuda_t*>(edge_attr.value().data_ptr<torch_t>()) : nullptr;
+                const index_t* edge_indices_ptr = nullptr;
+
+                if (has_edge_attr) {
+                    edge_indices_ptr =
+                        index_ptr<index_t>(backward_edge_indices.value());
+                }
+
+
                 size_t sh_r = DC * sizeof(cuda_t) + W * DC * sizeof(float);
 
                 dim3 blocks(num_nodes_bucket, H);
@@ -1620,7 +1703,14 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
                     r_ptr, stride_r_n, stride_r_h,
                     index_ptr<index_t>(row_ptr_T), index_ptr<index_t>(col_idx_T),
                     index_ptr<index_t>(node_indices),
-                    attn_ptr, d_logsumexp, d_G, negative_slope, grad_r_ptr);
+                    attn_ptr, d_logsumexp, d_G, negative_slope, grad_r_ptr,
+
+                    grad_edge_attr_ptr, 
+                    edge_attr_ptr, 
+                    stride_edge_attr_e, 
+                    stride_edge_attr_h,
+                    edge_indices_ptr
+                );
             }, MakeIndexVariant<int32_t, int64_t, uint32_t, uint64_t>(idx_dtype),
                MakeTypeVariant<float, at::Half, at::BFloat16>(l.scalar_type()),
                MakeIntVariant<32, 64, 128, 256>((int)D),
@@ -1691,5 +1781,5 @@ std::vector<torch::Tensor> gatv2_backward_cuda(
 
     torch::Tensor grad_a_reduced = grad_a_reduced_f32.to(input_dtype);
 
-    return {grad_l, grad_r, grad_a_reduced};
+    return {grad_l, grad_r, grad_a_reduced, grad_edge_attr};
 }

@@ -242,6 +242,9 @@ class gatv2_function(torch.autograd.Function):
             edge_attr
         )
 
+        if edge_attr is None:
+            grad_edge_attr = None
+
         # 4 CSR tensors + 3 gradients + 11 non-Variable args = 18 total + forward_edge_indices + backward_edge_indices + edge_attr
 
         return (None, None, None, None, grad_x_left, grad_x_right, grad_attention) + (None,) * 11 + (None,) * 2 + (grad_edge_attr,)
