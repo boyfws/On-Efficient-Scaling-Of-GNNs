@@ -50,12 +50,14 @@ def build_cuda_graph(edge_index: torch.Tensor, num_nodes: int):
         edge_weight=None,
         num_nodes=num_nodes,
         do_transpose=True,
+        add_edge_attr=False,
     )
     bwd_indptr, bwd_indices, _, _ = build_csr_as_is(
         edge_index,
         edge_weight=None,
         num_nodes=num_nodes,
         do_transpose=False,
+        add_edge_attr=False,
     )
     all_nodes = torch.arange(num_nodes, device=edge_index.device, dtype=torch.int32)
     empty_nodes = torch.tensor([], dtype=torch.int32, device=edge_index.device)

@@ -41,6 +41,8 @@ def build_csr_as_is(
     add_edge_attr: bool,
     num_nodes: int,
     do_transpose: bool = False,
+    *,
+    edge_weight: Optional[torch.Tensor] = None, # For tests only, not used in the CSR construction
 ):
     """Build CSR from COO edge_index.
 

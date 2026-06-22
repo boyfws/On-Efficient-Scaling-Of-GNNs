@@ -83,13 +83,13 @@ def gatv2_aggr(
     x: torch.Tensor,
     x_neighbors: torch.Tensor,
     attention_weights: torch.Tensor,
-    edge_attr: torch.Tensor | None = None,
     negative_slope: float = 0.2,
     grad_A_reduce_row_chunk_size: int = 512,
     forward_light_warps: int = 1,
     forward_heavy_warps: int = 8,
     backward_light_warps: int = 1,
     backward_heavy_warps: int = 8,
+    edge_attr: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """GATv2 attention-weighted aggregation.
 
