@@ -21,7 +21,7 @@ from src.data.converters import AdjacencyForwardBackwardWithNodeBuckets
 from turbo_gnn.ops import gatv2_aggr
 
 
-pytestmark = pytest.mark.cuda
+#pytestmark = pytest.mark.cuda
 
 
 def _edge_softmax(scores: torch.Tensor, dst: torch.Tensor, num_nodes: int) -> torch.Tensor:

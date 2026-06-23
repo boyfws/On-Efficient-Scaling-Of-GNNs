@@ -143,9 +143,9 @@ class gatv2_function(torch.autograd.Function):
         backward_light_warps,
         backward_heavy_warps,
         is_directed,
-        forward_edge_indices,
-        backward_edge_indices,
-        edge_attr,
+        forward_edge_indices=None,
+        backward_edge_indices=None,
+        edge_attr=None,
     ):
         if torch.is_autocast_enabled():
             attention_weights = attention_weights.to(torch.get_autocast_gpu_dtype())
